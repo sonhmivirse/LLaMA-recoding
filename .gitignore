@@ -1,0 +1,33 @@
+# Mac OS
+*.DS_Store
+
+# Datasets too big
+*.tar
+*.zst
+datasets/hh-rlhf
+datasets/red_pajama_mini
+datasets/stack_exchange_preferences
+
+
+# Checkpoints
+checkpoints/*
+merged_checkpoints/*
+meta_checkpoints/*
+
+
+
+# logs
+__pycache__/
+*.py[cod]
+*$py.class
+
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
