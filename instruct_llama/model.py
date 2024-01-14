@@ -1,10 +1,12 @@
 import logging
 from dataclasses import dataclass, asdict
 from typing_extensions import Self
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Iterable
+import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +61,13 @@ class ModelArgs:
         
         return cls(**config)
     
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device)  # type: ignore
+    freqs = torch.outer(t, freqs).float()  # type: ignore
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
+
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     ndim = x.ndim
     assert 0 <= 1 < ndim
@@ -127,7 +136,71 @@ class Attention(nn.Module):
         
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
         
+        if self.use_cache:
+            # should only use cache when do inference
+            self.cache_k = self.cache_k.to(xq)
+            self.cache_v = self.cache_v.to(xq)
+            
+            self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+            self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+            
+            keys = self.cache_k[:bsz, :start_pos + seqlen]
+            values = self.cache_v[:bsz, : start_pos + seqlen]
+        else:
+            keys = xk
+            values = xv
         
+        xq = xq.transpose(1, 2) # (bsz, n_heads, seqlen, head_dim)
+        keys = keys.transpose(1, 2)
+        values = values.transpose(1, 2)
+        
+        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if mask is not None:
+            scores = scores + mask # (bsz, n_heads, seq_len, cache_len + seqlen)
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        scores = self.attn_dropout(scores)
+        
+        output = torch.matmul(scores, values) # (bsz, n_heads, seqlen, head_dim)
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        output = self.wo(output)
+        output = self.resid_dropout(output)
+        return output
+
+    def disable_cache(self):
+        """Set use cache to False, and remove the k, v cache tensors if already exists."""
+        
+        self.use_cache = False
+        
+        if self.cache_k is not None:
+            del self.cache_k
+            self.cache_k = None
+        if self.cache_v is not None:
+            del self.cache_v
+            self.cache_v = None
+            
+    def enable_cache(self):
+        """Set use cache to True, and create the k, v cache tensors if not already exists."""
+        
+        self.use_cache = True
+        
+        if self.cache_k is None:
+            self.cache_k = torch.zeros(
+                (
+                    self.max_batch_size,
+                    self.max_seq_len,
+                    self.n_heads,
+                    self.head_dim
+                )
+            )
+        if self.cache_v is None:
+            self.cache_v = torch.zeros(
+                (
+                    self.max_batch_size,
+                    self.max_seq_len,
+                    self.n_heads,
+                    self.head_dim
+                )
+            )
     
 
 class FeedForward(nn.Module):
@@ -140,10 +213,35 @@ class FeedForward(nn.Module):
         resid_dropout: Optional[float] = 0.0
     ):
         super().__init__()
+        hidden_dim = int(2 * hidden_dim / 3)
+        # custom dim factor multiplier
+        if ffn_dim_multiplier is not None:
+            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+        
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, bias=False)
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+        
+        self.resid_dropout = nn.Dropout(resid_dropout) if resid_dropout > 0 else nn.Identity()
+        
+    def forward(self, x):
+        output = self.w2(F.silu(self.w1(x) * self.w3(x)))
+        output = self.resid_dropout(output)
+        return output
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+    
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+    
+    def forward(self, x):
+        output = self._norm(x.float())
+        return (output * self.weight).type_as(x)
 
 class TransformerBlock(nn.Module):
     def __init__(self, layer_id: int, args: ModelArgs):
@@ -174,3 +272,72 @@ class TransformerBlock(nn.Module):
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
     
+
+class Transformer(nn.Module):
+    def __init__(self, params: ModelArgs):
+        super().__init__()
+        self.params = params
+        self.vocab_size = params.vocab_size
+        self.n_layers = params.n_layers
+        
+        self.token_embeddings = nn.Embedding(params.vocab_size, params.dim)
+        self.embeddings_dropout = nn.Dropout(params.embed_dropout) if params.embed_dropout > 0 else nn.Identity()
+        
+        self.layers: Iterable[TransformerBlock] = torch.nn.ModuleList()
+        for layer_id in range(params.n_layers):
+            self.layers.append(TransformerBlock(layer_id, params))
+            
+        self.post_norm = RMSNorm(params.dim, eps=params.norm_eps)
+        
+        if self.params.head_type == "lm_head":
+            logger.info("Creating LLaMA-2 model with LM head...")
+            self.lm_head = nn.Linear(params.dim, params.vocab_size, bias=False)
+        elif self.params.head_type == "scalar_head":
+            logger.info("Creating LLaMA-2 model with scalar head ...")
+            self.scalar_head = nn.Linear(params.dim, 1, bias=True)
+            
+        self.freqs_cis = precompute_freqs_cis(self.params.dim // self.params.n_heads, self.params.max_seq_len * 2)
+        
+    def disable_cache(self):
+        """
+        When train the policy with RL, we want to use cache to speed up acting (generating training samples),
+        but use no cache when do learning. So we have disable_cache and enable_cache
+        """
+        for layer in self.layers:
+            layer.attention.disable_cache()
+            
+    def enable_cache(self):
+        for layer in self.layers:
+            layer.attention.enable_cache()
+            
+    def forward(self, tokens: torch.Tensor, start_pos: Optional[int] = 0) -> torch.Tensor:
+        _bsz, seqlen = tokens.shape
+        h = self.token_embeddings(tokens)
+        h = self.embeddings_dropout(h)
+        
+        self.freqs_cis = self.freqs_cis.to(h.device)
+        freq_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        
+        mask = None
+        if seqlen > 1:
+            mask = torch.full((1, 1, seqlen, seqlen), float('-inf'), device=tokens.device)
+            mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
+            
+        for layer in self.layers:
+            h = layer(h, start_pos, freq_cis, mask)
+        h = self.post_norm(h)
+        
+        if self.params.head_type == "lm_head":
+            output = self.lm_head(h).float()
+        elif self.params.head_type == "scalar_head":
+            output = self.scalar_head(h).float()
+        else:
+            output = h
+            
+        return output  
+    
+if __name__ == "__main__":
+    for type in ('7B', '13B', '70B'):
+        model_args = ModelArgs.from_model_type(type)
+        
+        print(model_args)  
