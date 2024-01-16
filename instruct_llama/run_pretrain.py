@@ -317,8 +317,7 @@ def fsdp_main():
         max_seq_len=cfg.max_seq_len,
         rank = rank,
         world_size=world_size, # shard the dataset
-        seed=
-        cfg.seed
+        seed=cfg.seed
     )
     
     # Out custom IterableDatasets already have sharding and shuffle mechanism implemented

@@ -93,7 +93,7 @@ def process_single_file(
     for row in read_zipped_jsonl_file(input_file):
         text = row["raw_content"]
         text_ids = tokenizer.encode(text, bos=True, eos=True)
-         
+
         ds_prefix = 'validation' if random.random() < validation_ratio else "train"
         tokens[ds_prefix].extend(text_ids)
         
