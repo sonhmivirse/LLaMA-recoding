@@ -4,6 +4,15 @@ import gzip
 import json
 
 
+def read_jsonl_file(input_file: str) -> Iterable[Mapping[Text, Any]]:
+    """Generator yields a list of json objects or None if input file not exists or is not .jsonl file."""
+    if not os.path.exists(input_file) or not os.path.isfile(input_file) or not input_file.endswith(".jsonl"):
+        return None
+    
+    with open(input_file, "r", encoding="utf-8") as file:
+        content = file.read()
+        return json.loads(content)
+
 def read_zipped_jsonl_file(input_file: str) -> Iterable[Mapping[Text, Any]]:
     """Generator yields a list json objects or None if input file not exists or is not .jsonl file."""
     if(
@@ -42,4 +51,13 @@ def find_certain_files_under_dir(root_dir: str, file_type: str = ".txt") -> Iter
                     files.append(os.path.join(root, f))
                     
     return files
+
+def count_words(raw_text, is_chinese=False) -> int:
+    if raw_text is None or raw_text == "":
+        return 0
+    
+    if is_chinese:
+        return len(raw_text)
+    
+    return len(raw_text.split())
 
